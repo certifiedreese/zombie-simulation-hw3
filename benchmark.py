@@ -1,51 +1,57 @@
 # ============================================================
-# benchmark.py - Experiments
+# benchmark.py - Experiments for parallel event processing
 #
-# Runs the simulation with no window and no FPS cap, and measures
-# how long each frame takes for different agent counts, storage
-# options, and finders (serial vs parallel). Each test runs several
-# times and the times are averaged. Prints a table for results.md.
+# Runs the simulation with no window and no FPS cap, at several
+# sizes and core counts, and times the event processing steps.
+# The map grows with the number of agents so the crowding stays
+# the same at every size. Prints a table for results.md.
 # ============================================================
 
 import time
+import math
 import random
 import simulation
 from simulation import Simulation
-from storage import InMemoryStore, SQLiteStore
+from storage import InMemoryStore
 from neighbors import SerialFinder, ParallelFinder
 
-FRAMES = 50    # frames per run
-REPEATS = 3    # runs per test, averaged
-SIZES = [(1000, 50), (5000, 250), (10000, 500)]  # (humans, zombies)
+FRAMES = 30     # frames per run
+REPEATS = 3     # runs per test, averaged
+SIZES = [(5000, 250), (10000, 500), (20000, 1000)]  # (humans, zombies)
+CORES = [1, 2, 4, 8]                                 # 1 = serial
+BASE_HUMANS = 1000  # 1,000 humans on an 800x600 map is the crowding we keep
 
 
 class TimedFinder:
-    """Wraps any finder and times its two jobs separately."""
+    """Wraps any finder and times the event map step."""
 
     def __init__(self, finder):
         self.finder = finder
-        self.neighbor_time = 0.0
         self.event_time = 0.0
 
     def find(self, zombie_positions, human_positions):
-        start = time.perf_counter()
-        result = self.finder.find(zombie_positions, human_positions)
-        self.neighbor_time += time.perf_counter() - start
-        return result
+        return self.finder.find(zombie_positions, human_positions)
 
-    def find_contacts(self, zombie_positions, human_positions):
+    def find_events(self, zombie_data, human_data, seed, frame):
         start = time.perf_counter()
-        result = self.finder.find_contacts(zombie_positions, human_positions)
+        result = self.finder.find_events(zombie_data, human_data, seed, frame)
         self.event_time += time.perf_counter() - start
         return result
 
 
-def run_once(make_store, finder, humans, zombies):
+def map_size(humans):
+    scale = math.sqrt(humans / BASE_HUMANS)
+    return int(800 * scale), int(600 * scale)
+
+
+def run_once(finder, humans, zombies):
+    # Grow the map so the crowding stays the same at every size
+    simulation.WIDTH, simulation.HEIGHT = map_size(humans)
     simulation.NUM_HUMANS = humans
     simulation.NUM_ZOMBIES = zombies
 
     timed = TimedFinder(finder)
-    sim = Simulation(make_store(), timed)
+    sim = Simulation(InMemoryStore(), timed)
     random.seed(42)  # same random start every time, so tests are fair
     sim.new_game()
 
@@ -58,37 +64,41 @@ def run_once(make_store, finder, humans, zombies):
         frames += 1
     total = time.perf_counter() - start
 
-    return (total / frames * 1000,                # ms per frame
-            timed.neighbor_time / frames * 1000,  # neighbor-finding ms
-            timed.event_time / frames * 1000,     # event detection ms
-            len(sim.get_humans()))                # humans left at the end
+    return (total / frames * 1000,             # ms per frame
+            timed.event_time / frames * 1000,  # event map ms (parallel part)
+            sim.resolve_time / frames * 1000,  # event reduce + apply ms (one core)
+            sim.fights,                        # total fights processed
+            len(sim.get_humans()))             # humans left at the end
 
 
-def run(make_store, finder, humans, zombies):
+def run(finder, humans, zombies):
     # Run the test REPEATS times and average the times
-    frame_ms = neighbor_ms = event_ms = 0.0
+    frame_ms = map_ms = reduce_ms = 0.0
     for _ in range(REPEATS):
-        f, n, e, left = run_once(make_store, finder, humans, zombies)
+        f, m, r, fights, left = run_once(finder, humans, zombies)
         frame_ms += f
-        neighbor_ms += n
-        event_ms += e
-    return frame_ms / REPEATS, neighbor_ms / REPEATS, event_ms / REPEATS, left
+        map_ms += m
+        reduce_ms += r
+    return frame_ms / REPEATS, map_ms / REPEATS, reduce_ms / REPEATS, fights, left
 
 
 def main():
-    serial = SerialFinder()
-    parallel = ParallelFinder(workers=4)
+    results = {}
+    for cores in CORES:
+        finder = SerialFinder() if cores == 1 else ParallelFinder(workers=cores)
+        for humans, zombies in SIZES:
+            results[(humans, cores)] = run(finder, humans, zombies)
+            print(f"done: {humans} humans, {cores} core(s)")
+        finder.close()
 
-    print("| Agents (H/Z) | Storage | Finder | ms per frame | neighbor ms | event ms | humans left |")
-    print("|---|---|---|---|---|---|---|")
+    print()
+    print("| Agents (H/Z) | Map size | Cores | ms per frame | event map ms | event reduce+apply ms | fights | humans left |")
+    print("|---|---|---|---|---|---|---|---|")
     for humans, zombies in SIZES:
-        for store_name, make_store in [("InMemory", InMemoryStore), ("SQLite", SQLiteStore)]:
-            for finder_name, finder in [("Serial", serial), ("Parallel", parallel)]:
-                f, n, e, left = run(make_store, finder, humans, zombies)
-                print(f"| {humans}/{zombies} | {store_name} | {finder_name} "
-                      f"| {f:.1f} | {n:.1f} | {e:.1f} | {left} |")
-
-    parallel.close()
+        w, h = map_size(humans)
+        for cores in CORES:
+            f, m, r, fights, left = results[(humans, cores)]
+            print(f"| {humans}/{zombies} | {w}x{h} | {cores} | {f:.1f} | {m:.1f} | {r:.2f} | {fights} | {left} |")
 
 
 if __name__ == "__main__":
