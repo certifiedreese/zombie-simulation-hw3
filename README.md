@@ -1,88 +1,93 @@
-# Zombie Simulation – CPS 310 Assignment 2
+# Zombie Simulation – CPS 310 Assignment 3
 
 **Author:** Reese Franklin
 
 ## What This Is
-A zombie simulation that runs with thousands of agents. It uses a database
-to store the agents, and splits the heavy work across several CPU cores so
-it runs faster.
+A zombie simulation with thousands of agents. For this assignment, I
+designed and built **parallel event processing**: fights between zombies
+and humans are found and settled across several CPU cores at the same
+time, while always giving the same results as one core.
+
+My proposal for my specialized concentration is in `PROPOSAL.md`.
 
 ## How to Run
 1. Install pygame-ce: `pip install pygame-ce`
 2. Play the game: `python main.py` (press R to restart)
-3. Run the experiments: `python benchmark.py`
-
-To switch options, change one line in `main.py`:
-- Storage: `store = SQLiteStore()` or `store = InMemoryStore()`
-- Speed mode: `finder = ParallelFinder(workers=4)` or `finder = SerialFinder()`
+3. Run the tests: `python test_events.py`
+4. Run the experiments: `python benchmark.py`
 
 ## The Files
 | File | Job |
 |---|---|
 | `main.py` | Opens the window and draws everything |
-| `simulation.py` | The game rules: moving, chasing, fighting |
+| `simulation.py` | The game rules, including the reduce and apply steps |
+| `neighbors.py` | The parallel work: neighbor-finding and the event map step |
 | `storage.py` | Saves the agents (database or memory) |
-| `neighbors.py` | Finds nearby agents, using one core or several |
+| `test_events.py` | Tests that prove the event processing is correct |
 | `benchmark.py` | Times the simulation for the experiments |
 | `results.md` | All experiment results |
+| `PROPOSAL.md` | My proposal for my specialized concentration |
 
-## How It Works
+## My Parallel Event Processing Design
 
-### 1. More agents
-The simulation runs with 1,000 to 10,000 humans, instead of 20.
+An **event** is a fight: a zombie touching a human. Each fight has two
+possible outcomes: the human kills the zombie (40% chance), or the human
+becomes a zombie (60% chance).
 
-### 2. A database
-Every human and zombie is saved as a row in a SQLite database table.
-The game can also use plain memory instead. Switching is one line,
-and the game rules don't change.
+The hard part of doing this in parallel is that fights **change things**.
+If two cores handled fights at the same time, two zombies could bite the
+same human and turn one human into two zombies. My algorithm prevents
+that with three steps: **map, reduce, and apply**.
 
-### 3. A grid
-The map is split into squares. A zombie only looks at humans in the
-squares near it, instead of every human on the map. This is much faster.
+### Step 1: Map (parallel)
+Each core takes a group of zombies. Each zombie looks at the humans it is
+touching, picks the **closest** one, and rolls the dice for that fight.
+This step only *proposes* fights. It doesn't change anything, so it is
+safe to do on many cores at once.
 
-### 4. Parallel neighbor-finding
-Each zombie has to find the closest human to chase. The zombies are
-split into 4 groups, and 4 CPU cores each handle one group at the
-same time.
+### Step 2: Reduce (one core)
+If two zombies proposed a fight with the **same human**, the closer
+zombie gets the fight (a tie goes to the lower zombie id). After this
+step, every zombie and every human is in **at most one fight**.
 
-### 5. Parallel event processing
-Events are the fights when a zombie touches a human. This happens in
-two parts:
-- **Detect (parallel):** the 4 cores each check their group of zombies
-  for touching humans. This is just looking, so it's safe to do at
-  the same time.
-- **Resolve (one at a time):** the fights are then applied in order.
-  This makes sure no human gets bitten twice by two zombies at once.
-I used processes instead of threads because Python only lets one
-thread run at a time (the GIL). Separate processes can truly run at
-the same time.
+### Step 3: Apply (one core)
+Because no agent is in two fights, the results are applied directly:
+dead zombies are removed, and bitten humans become zombies. No human can
+ever be bitten twice.
 
-## Experiments
-I timed each frame (lower is faster) at three sizes, with both
-storages and both speed modes. Each test ran 3 times and was averaged.
-Full tables are in `results.md`.
+### The dice trick
+Each fight's dice roll comes from a formula using the game's seed, the
+frame number, the zombie's id, and the human's id. So the same fight
+always gets the same roll, **no matter which core rolls it**. This is why
+1 core and 8 cores give exactly the same results.
 
-| Test | One core | Four cores | Result |
-|---|---|---|---|
-| 1,000 humans, whole frame (InMemory) | 11.1 ms | 13.9 ms | Parallel slightly slower |
-| 5,000 humans, whole frame (InMemory) | 169.9 ms | 80.3 ms | About 2x faster |
-| 5,000 humans, neighbor-finding (InMemory) | 79.7 ms | 24.3 ms | About 3x faster |
-| 10,000 humans, neighbor-finding (SQLite) | 127.3 ms | 52.5 ms | About 2.4x faster |
+### Splitting the map (spatial partitioning)
+The map is cut into vertical **slices**, one per core, with the same
+number of zombies in each. Each core gets:
+- the zombies in its slice, and
+- only the humans in its slice, plus a thin **border (halo)** on each
+  side, so a zombie at the edge can still reach a human just across
+  the line.
 
-### What I Learned
-- **Same results:** the number of humans left was the same with one core
-  or four, so parallel only changed the speed, not the outcome.
-- **Small sizes:** parallel was slower, because sending work to the cores
-  takes time. With little work, that cost isn't worth it.
-- **Big sizes:** parallel was 2 to 3 times faster, because there is
-  enough work to split up.
-- **Not 4x faster:** some time is always spent sending data to the cores
-  and collecting the answers.
-- **The database adds time:** saving thousands of rows every frame is
-  done one step at a time, so it limits the total speedup.
+Each core then builds a grid of **only its slice**, so zombies only
+check nearby squares.
 
-### Limitations
-- The map stays the same size, so big tests are very crowded and the
-  zombies take over fast (all humans were gone within 50 frames at 10,000).
-- Some results vary between runs because of other things happening
-  on the computer.
+## Parallelism Techniques Used
+- **Processes, not threads:** Python's GIL only lets one thread run
+  Python code at a time, so I use separate processes, which truly run
+  at the same time.
+- **A worker pool:** the processes are created once and reused every
+  frame, because starting a process takes time.
+- **Data partitioning:** the map is split into slices, so each core
+  works on its own piece of the data.
+- **Map-reduce:** the parallel part only proposes fights, and the
+  conflicts are settled on one core, so there are no race conditions.
+
+## Testing
+`test_events.py` runs 6 tests, and all pass:
+1. Dice rolls are repeatable.
+2. A zombie picks the closest human it touches.
+3. No touch means no fight.
+4. Only one fight per human: if two zombies grab the same human,
+   only the closer one fights.
+5. No agent is ever duplicated over 30 frames, and
